@@ -1,10 +1,11 @@
 import argparse
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 
-from epsiloc.dataset import load, save
+from epsiloc.dataset import load, read_rows, save
 from epsiloc.mechanisms import laplace, discrete_laplace, k_randomized_response
 
 
@@ -16,11 +17,11 @@ def privatize(dataset_path):
         for value, col in zip(row, metadata):
             t = col["type"]
             if t == "discrete":
-                out.append(discrete_laplace(int(value), col["epsilon"], col["min"], col["max"]))
+                out.append(discrete_laplace(value, col["epsilon"], col["min"], col["max"]))
             elif t == "continuous":
-                out.append(laplace(float(value), col["epsilon"], col["min"], col["max"], col["decimal_places"]))
+                out.append(laplace(value, col["epsilon"], col["min"], col["max"], col["decimal_places"]))
             elif t == "categorical":
-                out.append(k_randomized_response(str(value), col["epsilon"], col["categories"]))
+                out.append(k_randomized_response(value, col["epsilon"], col["categories"]))
             else:
                 raise ValueError(f"Unknown column type: {t!r}")
         result.append(out)
@@ -32,8 +33,11 @@ def create_metadata(csv_path):
     if not path.exists():
         raise FileNotFoundError(f"{csv_path} does not exist")
 
-    with open(path, "r", encoding="utf-8") as f:
-        num_columns = len(next(csv.reader(f)))
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        first_row = next(csv.reader(f), None)
+    if not first_row:
+        raise ValueError(f"{csv_path} is empty.")
+    num_columns = len(first_row)
 
     metadata = []
     for i in range(num_columns):
@@ -48,9 +52,9 @@ def create_metadata(csv_path):
         while True:
             try:
                 epsilon = float(input("  Epsilon (> 0): ").strip())
-                if epsilon > 0:
+                if epsilon > 0 and math.isfinite(epsilon):
                     break
-                print("  Epsilon must be > 0.")
+                print("  Epsilon must be a positive finite number.")
             except ValueError:
                 print("  Enter a number.")
 
@@ -59,13 +63,14 @@ def create_metadata(csv_path):
         if col_type in ("discrete", "continuous"):
             while True:
                 try:
-                    mn = float(input("  Min: ").strip())
-                    mx = float(input("  Max: ").strip())
+                    cast = int if col_type == "discrete" else float
+                    mn = cast(input("  Min: ").strip())
+                    mx = cast(input("  Max: ").strip())
                     if mx > mn:
                         break
                     print("  Max must be strictly greater than min.")
                 except ValueError:
-                    print("  Enter numbers.")
+                    print("  Enter integers." if col_type == "discrete" else "  Enter numbers.")
             col.update({"min": mn, "max": mx})
 
         if col_type == "continuous":
@@ -107,10 +112,7 @@ def stats(base_path):
 
     metadata, orig_rows = load(base_path)
 
-    converters = {"continuous": float, "discrete": int, "categorical": str}
-    conv = [converters[col["type"]] for col in metadata]
-    with open(private_path, "r", encoding="utf-8") as f:
-        priv_rows = [[c(v) for c, v in zip(conv, row)] for row in csv.reader(f)]
+    priv_rows = read_rows(private_path, metadata)
 
     orig = np.array(orig_rows, dtype=object)
     priv = np.array(priv_rows, dtype=object)
@@ -129,8 +131,7 @@ def stats(base_path):
 
         if col_type == "continuous":
             o, p = o.astype(float), p.astype(float)
-            lo, hi = min(o.min(), p.min()), max(o.max(), p.max())
-            bins = np.linspace(lo, hi, max(1, int((hi - lo) / 0.1)) + 1)
+            bins = np.histogram_bin_edges(np.concatenate([o, p]), bins=30)
             ax.hist(o, bins=bins, density=True, alpha=0.5, label="Original", color="tab:blue")
             ax.hist(p, bins=bins, density=True, alpha=0.5, label="Privatized", color="tab:orange")
             ax.set_ylabel("Density")
@@ -138,10 +139,12 @@ def stats(base_path):
         elif col_type == "discrete":
             o, p = o.astype(int), p.astype(int)
             lo, hi = min(o.min(), p.min()), max(o.max(), p.max())
-            bins = np.arange(lo - 0.5, hi + 1.5, 1)
+            width = max(1, -(-(hi - lo + 1) // 30))
+            bins = np.arange(lo - 0.5, hi + 0.5 + width, width)
             ax.hist(o, bins=bins, alpha=0.5, label="Original", color="tab:blue")
             ax.hist(p, bins=bins, alpha=0.5, label="Privatized", color="tab:orange")
-            ax.set_xticks(np.arange(lo, hi + 1))
+            if width == 1:
+                ax.set_xticks(np.arange(lo, hi + 1))
             ax.set_ylabel("Count")
 
         elif col_type == "categorical":
@@ -181,13 +184,18 @@ def main():
         parser.print_help(sys.stderr)
         sys.exit(1)
 
-    if args.metadata:
-        create_metadata(args.dataset)
-    if args.privatize:
-        privatize(args.dataset)
-        print("|> Privatized dataset generated.")
-    if args.stats:
-        stats(args.dataset)
+    try:
+        if args.metadata:
+            create_metadata(args.dataset)
+        if args.privatize:
+            privatize(args.dataset)
+            print("|> Privatized dataset generated.")
+        if args.stats:
+            stats(args.dataset)
+    except (FileNotFoundError, ValueError) as e:
+        sys.exit(f"error: {e}")
+    except (KeyboardInterrupt, EOFError):
+        sys.exit("\naborted.")
 
 
 if __name__ == "__main__":

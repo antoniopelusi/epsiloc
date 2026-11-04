@@ -18,10 +18,12 @@ def discrete_laplace(x, epsilon, lo, hi):
     if hi <= lo:
         raise ValueError("hi must be > lo.")
 
-    alpha = np.exp(-epsilon / (hi - lo))
-    p = 1.0 - alpha
-    noise = (np.random.geometric(p) - 1) - (np.random.geometric(p) - 1)
-    return int(np.clip(x + noise, lo, hi))
+    # Difference of two i.i.d. geometric variables (support 0, 1, ...) is a discrete
+    # Laplace with P(k) ∝ exp(-epsilon * |k| / (hi - lo)). expm1 keeps p accurate
+    # when epsilon / (hi - lo) is tiny; Python ints avoid int64 overflow.
+    p = -np.expm1(-epsilon / (hi - lo))
+    noise = (int(np.random.geometric(p)) - 1) - (int(np.random.geometric(p)) - 1)
+    return int(min(max(x + noise, lo), hi))
 
 
 def k_randomized_response(x, epsilon, categories):
@@ -34,7 +36,8 @@ def k_randomized_response(x, epsilon, categories):
 
     k = len(categories)
     idx = categories.index(x)
-    p = np.exp(epsilon) / (np.exp(epsilon) + k - 1)
+    # e^eps / (e^eps + k - 1), written so that it cannot overflow for large epsilon.
+    p = 1.0 / (1.0 + (k - 1) * np.exp(-epsilon))
 
     if np.random.random() < p:
         return x

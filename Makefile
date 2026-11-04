@@ -1,3 +1,4 @@
+.PHONY: all setup privatize stats metadata
 .SILENT: all setup privatize stats metadata
 
 all:
