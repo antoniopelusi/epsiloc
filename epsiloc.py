@@ -5,47 +5,88 @@ import math
 import sys
 from pathlib import Path
 
-from epsiloc.dataset import load, read_rows, save
-from epsiloc.mechanisms import laplace, discrete_laplace, k_randomized_response
+from epsiloc.dataset import (
+    SOURCES,
+    config_file,
+    dataset_file,
+    load,
+    load_hf,
+    output_path,
+    read_rows,
+    save,
+    save_original,
+)
+from epsiloc.mechanisms import k_randomized_response, laplace
 
 
-def privatize(dataset_path):
-    metadata, data = load(dataset_path)
+def privatize(config_path):
+    metadata, data = load(config_path)
+    save_original(data, metadata, config_path)
     result = []
     for row in data:
         out = []
         for value, col in zip(row, metadata):
             t = col["type"]
             if t == "discrete":
-                out.append(discrete_laplace(value, col["epsilon"], col["min"], col["max"]))
+                out.append(
+                    int(laplace(value, col["epsilon"], col["min"], col["max"], 0))
+                )
             elif t == "continuous":
-                out.append(laplace(value, col["epsilon"], col["min"], col["max"], col["decimal_places"]))
+                out.append(
+                    laplace(
+                        value,
+                        col["epsilon"],
+                        col["min"],
+                        col["max"],
+                        col["decimal_places"],
+                    )
+                )
             elif t == "categorical":
-                out.append(k_randomized_response(value, col["epsilon"], col["categories"]))
+                out.append(
+                    k_randomized_response(value, col["epsilon"], col["categories"])
+                )
             else:
                 raise ValueError(f"Unknown column type: {t!r}")
         result.append(out)
-    save(result, dataset_path)
+    save(result, metadata, config_path)
 
 
-def create_metadata(csv_path):
-    path = Path(csv_path)
-    if not path.exists():
-        raise FileNotFoundError(f"{csv_path} does not exist")
+def create_metadata(config_path):
+    while True:
+        source = input("Source (local, hf) [local]: ").strip().lower() or "local"
+        if source in SOURCES:
+            break
+        print("  Invalid source.")
 
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
-        first_row = next(csv.reader(f), None)
-    if not first_row:
-        raise ValueError(f"{csv_path} is empty.")
-    num_columns = len(first_row)
+    if source == "local":
+        dataset_name = input("Dataset (CSV file name in data/datasets): ").strip()
+        dataset = dataset_file(dataset_name)
+        if not dataset.is_file():
+            raise FileNotFoundError(f"Dataset not found: {dataset}")
 
-    metadata = []
-    for i in range(num_columns):
-        print(f"\nColumn {i + 1}/{num_columns}:")
+        with open(dataset, "r", encoding="utf-8-sig", newline="") as f:
+            column_names = next(csv.reader(f), None)
+        if not column_names:
+            raise ValueError(f"{dataset_name} is empty: a header row is required.")
+        if len(set(column_names)) != len(column_names):
+            raise ValueError(f"{dataset_name}: the header row has duplicate names.")
+        address = {"name": dataset_name, "source": source}
+    else:
+        dataset_name = input("Dataset (Hugging Face name, e.g. user/dataset): ").strip()
+        split = input("Split [train]: ").strip() or "train"
+        address = {"name": dataset_name, "source": source, "split": split}
+        column_names = list(load_hf(address).column_names)
+        if not column_names:
+            raise ValueError(f"{dataset_name} has no columns.")
+
+    fields = {}
+    range_explained = False
+    for i, name in enumerate(column_names):
+        print(f"\nColumn {i + 1}/{len(column_names)}: {name}")
 
         while True:
-            col_type = input("  Type (discrete, continuous, categorical): ").strip().lower()
-            if col_type in ("discrete", "continuous", "categorical"):
+            col_type = input("  Type (int, float, str): ").strip().lower()
+            if col_type in ("int", "float", "str"):
                 break
             print("  Invalid type.")
 
@@ -58,22 +99,37 @@ def create_metadata(csv_path):
             except ValueError:
                 print("  Enter a number.")
 
-        col = {"type": col_type, "epsilon": epsilon}
+        field = {"type": col_type, "epsilon": epsilon}
 
-        if col_type in ("discrete", "continuous"):
+        if col_type in ("int", "float"):
+            if not range_explained:
+                range_explained = True
+                print(
+                    "  Range: smallest and largest value the column can take. Values "
+                    "outside it are rejected,\n  and the noise grows with max - min, "
+                    "so use real bounds, not ones read off the data."
+                )
             while True:
                 try:
-                    cast = int if col_type == "discrete" else float
-                    mn = cast(input("  Min: ").strip())
-                    mx = cast(input("  Max: ").strip())
+                    cast = int if col_type == "int" else float
+                    raw_min = input(
+                        "  Min (leave empty to infer min and max from the data): "
+                    ).strip()
+                    if not raw_min:
+                        field["range"] = []
+                        break
+                    mn = cast(raw_min)
+                    mx = cast(input("  Max (greater than min): ").strip())
                     if mx > mn:
+                        field["range"] = [mn, mx]
                         break
                     print("  Max must be strictly greater than min.")
                 except ValueError:
-                    print("  Enter integers." if col_type == "discrete" else "  Enter numbers.")
-            col.update({"min": mn, "max": mx})
+                    print(
+                        "  Enter integers." if col_type == "int" else "  Enter numbers."
+                    )
 
-        if col_type == "continuous":
+        if col_type == "float":
             while True:
                 try:
                     dp = int(input("  Decimal places (>= 0): ").strip())
@@ -82,35 +138,45 @@ def create_metadata(csv_path):
                     print("  Must be >= 0.")
                 except ValueError:
                     print("  Enter an integer.")
-            col["decimal_places"] = dp
+            field["decimal_places"] = dp
 
-        if col_type == "categorical":
+        if col_type == "str":
             while True:
-                cats = [c.strip() for c in input("  Categories (comma-separated, >= 2): ").strip().split(",") if c.strip()]
-                if len(cats) >= 2:
+                raw = input(
+                    "  Categories, comma-separated (e.g. a,b,c; at least 2)\n"
+                    "  (leave empty to infer them from the data): "
+                ).strip()
+                cats = [c.strip() for c in raw.split(",") if c.strip()]
+                if not raw or len(cats) >= 2:
                     break
                 print("  At least 2 categories required.")
-            col["categories"] = cats
+            field["range"] = cats
 
-        metadata.append(col)
+        if not field["range"]:
+            print(
+                "  Range left empty: it will be inferred from the data at run time "
+                "(no DP guarantee for this column)."
+            )
 
-    out_path = path.with_suffix(".json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=4)
-    print(f"Metadata saved to {out_path}")
+        fields[name] = field
+
+    config = {"dataset": {**address, "fields": fields}}
+    Path(config_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=4)
+    print(f"Metadata saved to {config_path}")
 
 
-def stats(base_path):
+def stats(config_path):
     import matplotlib.pyplot as plt
     import numpy as np
 
-    base = Path(base_path)
-    private_path = base.with_name(base.stem + "_privatized.csv")
+    private_path = output_path(config_path)
 
     if not private_path.exists():
         raise FileNotFoundError(f"Privatized dataset not found: {private_path}")
 
-    metadata, orig_rows = load(base_path)
+    metadata, orig_rows = load(config_path)
 
     priv_rows = read_rows(private_path, metadata)
 
@@ -132,8 +198,22 @@ def stats(base_path):
         if col_type == "continuous":
             o, p = o.astype(float), p.astype(float)
             bins = np.histogram_bin_edges(np.concatenate([o, p]), bins=30)
-            ax.hist(o, bins=bins, density=True, alpha=0.5, label="Original", color="tab:blue")
-            ax.hist(p, bins=bins, density=True, alpha=0.5, label="Privatized", color="tab:orange")
+            ax.hist(
+                o,
+                bins=bins,
+                density=True,
+                alpha=0.5,
+                label="Original",
+                color="tab:blue",
+            )
+            ax.hist(
+                p,
+                bins=bins,
+                density=True,
+                alpha=0.5,
+                label="Privatized",
+                color="tab:orange",
+            )
             ax.set_ylabel("Density")
 
         elif col_type == "discrete":
@@ -166,17 +246,29 @@ def stats(base_path):
     for k in range(num_cols, len(axes)):
         fig.delaxes(axes[k])
 
-    fig.suptitle(f"Original vs Privatized — {base.stem}", fontsize=14)
+    fig.suptitle(f"Original vs Privatized — {Path(config_path).stem}", fontsize=14)
     plt.tight_layout()
     plt.show()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="epsiloc — local differential privacy toolkit")
-    parser.add_argument("dataset", help="Path to the dataset (.csv)")
-    parser.add_argument("--privatize", action="store_true", help="Privatize the dataset")
-    parser.add_argument("--metadata", action="store_true", help="Create metadata JSON interactively")
-    parser.add_argument("--stats", action="store_true", help="Compare original vs privatized distributions")
+    parser = argparse.ArgumentParser(
+        description="epsiloc — local differential privacy toolkit"
+    )
+    parser.add_argument(
+        "config", help="Name of the config, stored in configs/ (e.g. iris)"
+    )
+    parser.add_argument(
+        "--privatize", action="store_true", help="Privatize the dataset"
+    )
+    parser.add_argument(
+        "--metadata", action="store_true", help="Create the config JSON interactively"
+    )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Compare original vs privatized distributions",
+    )
 
     args = parser.parse_args()
 
@@ -185,13 +277,14 @@ def main():
         sys.exit(1)
 
     try:
+        config = config_file(args.config)
         if args.metadata:
-            create_metadata(args.dataset)
+            create_metadata(config)
         if args.privatize:
-            privatize(args.dataset)
+            privatize(config)
             print("|> Privatized dataset generated.")
         if args.stats:
-            stats(args.dataset)
+            stats(config)
     except (FileNotFoundError, ValueError) as e:
         sys.exit(f"error: {e}")
     except (KeyboardInterrupt, EOFError):

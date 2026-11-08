@@ -1,0 +1,36 @@
+{
+    "dataset": {
+        "name": "antoniopelusi/iris",
+        "source": "hf",
+        "split": "train",
+        "fields": {
+            "sepal-length": {
+                "type": "int",
+                "epsilon": 5.0,
+                "range": []
+            },
+            "sepal-width": {
+                "type": "int",
+                "epsilon": 5.0,
+                "range": []
+            },
+            "petal-length": {
+                "type": "float",
+                "epsilon": 5.0,
+                "range": [],
+                "decimal_places": 1
+            },
+            "petal-width": {
+                "type": "float",
+                "epsilon": 5.0,
+                "range": [],
+                "decimal_places": 1
+            },
+            "species": {
+                "type": "str",
+                "epsilon": 5.0,
+                "range": []
+            }
+        }
+    }
+}
